@@ -1,0 +1,21 @@
+rules_version = '2';
+// Somente os e-mails desta lista (até 3 pessoas) podem ler e gravar os dados da associação.
+// Troque os exemplos pelos e-mails reais, em letras minúsculas, e publique em
+// Console do Firebase > Firestore Database > Regras.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function permitido() {
+      return request.auth != null && request.auth.token.email in [
+        'presidente@exemplo.com',
+        'usuario2@exemplo.com',
+        'usuario3@exemplo.com'
+      ];
+    }
+    match /associacoes/{assoc} {
+      allow read, write: if permitido();
+      match /{colecao}/{id} {
+        allow read, write: if permitido();
+      }
+    }
+  }
+}

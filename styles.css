@@ -189,3 +189,20 @@ main { padding: 16px; max-width: 640px; margin: 0 auto; }
 
 .rodape-nota { font-size: 13px; color: var(--muted); text-align: center; margin-top: 18px; }
 .mt { margin-top: 14px; }
+
+/* ---------- relatórios por tipo ---------- */
+.tipos { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tipo { text-align: left; border: 1.5px solid var(--linha); background: #fff; border-radius: 12px; padding: 12px; min-height: 64px; cursor: pointer; }
+.tipo b { display: block; font-size: 16px; color: var(--ink); }
+.tipo span { font-size: 13px; color: var(--muted); }
+.tipo.ativo { border-color: var(--teal); background: var(--teal-soft); }
+.tipo.ativo b { color: var(--teal); }
+.tipos .tipo:first-child { grid-column: span 2; }
+
+/* ---------- sincronização ---------- */
+.status { display: inline-block; margin-top: 4px; font-size: 12px; font-weight: 700; padding: 2px 10px; border-radius: 20px; background: rgba(255,255,255,.16); }
+.status.alerta { background: var(--gold); color: var(--ink); }
+.login-logo { width: 72px; height: 72px; border-radius: 18px; display: block; margin: 4px auto 12px; }
+.modal h2.centro { text-align: center; }
+.link-btn { background: none; border: 0; color: var(--teal); font-weight: 700; text-decoration: underline; min-height: 44px; width: 100%; cursor: pointer; }
+[hidden] { display: none !important; }

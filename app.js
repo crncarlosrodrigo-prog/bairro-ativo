@@ -1,5 +1,7 @@
 /* Bairro Ativo – PWA de cursos, eventos e caixa para associações de moradores.
-   Dados guardados apenas no aparelho (IndexedDB, com localStorage como reserva). */
+   Modo local: dados só no aparelho (IndexedDB, com localStorage como reserva).
+   Modo sincronizado (firebase-config.js preenchido): até 3 usuários com login, dados no
+   Cloud Firestore com cópia offline em cada celular. */
 'use strict';
 
 const ASSOC_PADRAO = 'Associação Comunitária Santo Inácio de Loyola';
@@ -55,7 +57,152 @@ function estadoVazio() {
 }
 let E = estadoVazio();
 
-async function salvar() { E.atualizadoEm = new Date().toISOString(); await Banco.gravar(E); }
+async function salvar() {
+  E.atualizadoEm = new Date().toISOString();
+  if (Nuvem.ativa) Nuvem.enviarMudancas();
+  await Banco.gravar(E);
+}
+
+/* ================= sincronização (Firebase) ================= */
+const COLECOES = ['cursos', 'turmas', 'alunos', 'matriculas', 'eventos', 'lancamentos'];
+const Nuvem = {
+  cfg: window.BAIRRO_ATIVO_FIREBASE || null,
+  ativa: false, user: null, db: null, base: {}, prontos: new Set(), escutas: [],
+  pendente: false, offline: !navigator.onLine, localInicial: null, migracaoVerificada: false,
+  configurada() { return !!(this.cfg && this.cfg.config && this.cfg.config.apiKey && window.firebase); },
+  doc() { return this.db.collection('associacoes').doc(this.cfg.associacaoId || 'principal'); },
+  async iniciar() {
+    firebase.initializeApp(this.cfg.config);
+    if (this.cfg.emulador) {
+      firebase.auth().useEmulator(`http://${this.cfg.emulador}:9099`, { disableWarnings: true });
+      firebase.firestore().useEmulator(this.cfg.emulador, 8080);
+    }
+    this.db = firebase.firestore();
+    try { await this.db.enablePersistence({ synchronizeTabs: true }); } catch (e) { /* outro modo de cache */ }
+    window.addEventListener('online', () => { this.offline = false; this.mostrarStatus(); });
+    window.addEventListener('offline', () => { this.offline = true; this.mostrarStatus(); });
+    firebase.auth().onAuthStateChanged(u => {
+      this.user = u;
+      if (u) { fecharModal(true); this.conectar(); }
+      else { this.desconectar(); telaLogin(); }
+    });
+  },
+  conectar() {
+    this.ativa = true; this.prontos.clear(); this.mostrarStatus();
+    COLECOES.forEach(col => {
+      const parar = this.doc().collection(col).onSnapshot({ includeMetadataChanges: true }, snap => {
+        const itens = snap.docs.map(d => d.data());
+        E[col] = itens;
+        this.base[col] = new Map(itens.map(i => [i.id, JSON.stringify(i)]));
+        this.pendente = snap.metadata.hasPendingWrites;
+        this.prontos.add(col);
+        if (this.prontos.size === COLECOES.length) {
+          Banco.gravar(E);
+          if (!this.migracaoVerificada) this.verificarMigracao();
+          agendarRender();
+        }
+        this.mostrarStatus();
+      }, err => { console.error(err); aviso(err.code === 'permission-denied' ? 'Este usuário não tem permissão para os dados da associação.' : 'Erro de sincronização. Os dados seguem salvos no celular.'); });
+      this.escutas.push(parar);
+    });
+    this.escutas.push(this.doc().onSnapshot(d => {
+      const nome = d.exists && d.data().associacao;
+      if (nome && nome !== E.config.associacao) { E.config.associacao = nome; agendarRender(); }
+    }, () => {}));
+  },
+  desconectar() { this.escutas.forEach(f => f()); this.escutas = []; this.ativa = false; this.mostrarStatus(); },
+  limpo(item) { return JSON.parse(JSON.stringify(item)); },  // remove campos undefined
+  enviarMudancas() {
+    if (!this.ativa || this.prontos.size < COLECOES.length) return;
+    const ops = [], agora = new Date().toISOString(), email = this.user ? this.user.email : '';
+    COLECOES.forEach(col => {
+      const base = this.base[col] || new Map(); this.base[col] = base;
+      const atual = new Map(E[col].map(i => [i.id, i]));
+      atual.forEach((item, id) => {
+        if (base.get(id) === JSON.stringify(item)) return;
+        item._por = email; item._em = agora;
+        const limpo = this.limpo(item);
+        ops.push(b => b.set(this.doc().collection(col).doc(id), limpo));
+        base.set(id, JSON.stringify(item));
+      });
+      [...base.keys()].forEach(id => {
+        if (atual.has(id)) return;
+        ops.push(b => b.delete(this.doc().collection(col).doc(id)));
+        base.delete(id);
+      });
+    });
+    for (let i = 0; i < ops.length; i += 400) {  // limite de 500 operações por lote
+      const lote = this.db.batch(); ops.slice(i, i + 400).forEach(f => f(lote));
+      lote.commit().catch(err => { console.error(err); aviso('Não foi possível enviar à nuvem: ' + (err.code === 'permission-denied' ? 'sem permissão.' : 'tente de novo.')); });
+    }
+    if (ops.length) { this.pendente = true; this.mostrarStatus(); }
+  },
+  salvarNome(nome) { if (this.ativa) this.doc().set({ associacao: nome }, { merge: true }).catch(() => {}); },
+  async verificarMigracao() {
+    this.migracaoVerificada = true;
+    const nuvemVazia = COLECOES.every(c => !E[c].length);
+    const L = this.localInicial;
+    const temLocal = L && COLECOES.some(c => (L[c] || []).length);
+    if (!nuvemVazia || !temLocal) return;
+    const resumo = `${L.cursos.length} curso(s), ${L.alunos.length} aluno(s), ${L.eventos.length} evento(s) e ${L.lancamentos.length} lançamento(s)`;
+    if (await confirmar('Enviar os dados deste celular?', `A conta ainda está vazia. Este celular tem ${resumo}. Deseja enviá-los para que apareçam em todos os celulares?`, 'Enviar')) {
+      COLECOES.forEach(c => { E[c] = (L[c] || []).map(x => ({ ...x })); });
+      await salvar();
+      this.salvarNome(E.config.associacao); aviso('Dados enviados para a nuvem'); render(true);
+    }
+  },
+  textoStatus() {
+    if (!this.ativa) return 'Desconectado';
+    if (this.offline) return 'Sem internet: salvo neste celular, envia quando conectar';
+    if (this.pendente) return 'Enviando alterações…';
+    return 'Sincronizado';
+  },
+  mostrarStatus() {
+    const el = $('#status'); if (!el) return;
+    el.hidden = !this.ativa;
+    el.textContent = (this.offline ? '⚠ ' : this.pendente ? '⟳ ' : '✓ ') + (this.offline ? 'Sem internet' : this.pendente ? 'Enviando…' : 'Sincronizado');
+    el.classList.toggle('alerta', this.offline);
+    const t = $('#statusTxt'); if (t) t.textContent = this.textoStatus();
+  },
+  async sair() {
+    if (!(await confirmar('Sair da conta?', 'Os dados continuam na nuvem e nos outros celulares. Neste celular, será preciso entrar de novo com e-mail e senha.', 'Sair da conta'))) return;
+    this.desconectar();
+    await Banco.gravar(estadoVazio());
+    try { await firebase.auth().signOut(); await this.db.terminate(); await this.db.clearPersistence(); } catch (e) { /* segue */ }
+    location.replace(location.pathname + '#/inicio'); location.reload();
+  }
+};
+
+function telaLogin() {
+  abrirModal(`<img class="login-logo" src="icons/icon-192.png" alt=""><h2 class="centro">Entrar no Bairro Ativo</h2>
+    <p class="ajuda" style="text-align:center">Use o e-mail e a senha cadastrados para a associação. Até 3 pessoas podem usar o app ao mesmo tempo.</p>
+    <form id="f" novalidate>${campo('email', 'E-mail', '', 'email', 'autocomplete="username" inputmode="email"')}
+    ${campo('senha', 'Senha', '', 'password', 'autocomplete="current-password"')}
+    <button class="btn" id="entrar">Entrar</button>
+    <button type="button" class="link-btn" id="esqueci">Esqueci minha senha</button></form>`,
+  m => {
+    const f = m.querySelector('#f');
+    f.onsubmit = async ev => {
+      ev.preventDefault(); limparErros(f);
+      const email = f.email.value.trim().toLowerCase(), senha = f.senha.value;
+      if (!email.includes('@')) return erroCampo(f, 'email', 'Digite o e-mail.');
+      if (!senha) return erroCampo(f, 'senha', 'Digite a senha.');
+      const b = m.querySelector('#entrar'); b.disabled = true; b.textContent = 'Entrando…';
+      try { await firebase.auth().signInWithEmailAndPassword(email, senha); }
+      catch (err) {
+        b.disabled = false; b.textContent = 'Entrar';
+        const msg = { 'auth/invalid-credential': 'E-mail ou senha incorretos.', 'auth/wrong-password': 'Senha incorreta.', 'auth/user-not-found': 'E-mail não cadastrado.', 'auth/invalid-email': 'E-mail inválido.', 'auth/too-many-requests': 'Muitas tentativas. Espere alguns minutos.', 'auth/network-request-failed': 'Sem internet. O primeiro acesso precisa de conexão.', 'auth/invalid-login-credentials': 'E-mail ou senha incorretos.' }[err.code] || 'Não foi possível entrar. Tente de novo.';
+        erroCampo(f, 'senha', msg);
+      }
+    };
+    m.querySelector('#esqueci').onclick = async () => {
+      const email = f.email.value.trim().toLowerCase();
+      if (!email.includes('@')) return erroCampo(f, 'email', 'Digite o e-mail para receber o link.');
+      try { await firebase.auth().sendPasswordResetEmail(email); aviso('Enviamos um link para criar nova senha'); }
+      catch (e) { aviso('Não foi possível enviar o link.'); }
+    };
+  }, true);
+}
 
 /* ================= utilidades ================= */
 const $ = s => document.querySelector(s);
@@ -133,16 +280,20 @@ function aviso(msg) {
   const el = $('#aviso'); el.textContent = msg; el.hidden = false;
   clearTimeout(tAviso); tAviso = setTimeout(() => { el.hidden = true; }, 2600);
 }
-function abrirModal(html, aoMontar) {
+function abrirModal(html, aoMontar, fixo = false) {
   const m = $('#modal');
   m.innerHTML = html; m.hidden = false; $('#fundoModal').hidden = false;
+  m.dataset.fixo = fixo ? '1' : '';
+  $('#aviso').hidden = true;
   document.body.style.overflow = 'hidden';
   m.querySelectorAll('[data-fechar]').forEach(b => b.addEventListener('click', fecharModal));
   if (aoMontar) aoMontar(m);
   const f = m.querySelector('input:not([type=radio]):not([type=checkbox]), select, textarea');
   if (f && !f.dataset.semFoco) setTimeout(() => f.focus(), 60);
 }
-function fecharModal() {
+function fecharModal(forcar) {
+  if ($('#modal').dataset.fixo && forcar !== true) return;
+  $('#modal').dataset.fixo = ''; $('#modal').dataset.saida = '';
   $('#modal').hidden = true; $('#fundoModal').hidden = true; $('#modal').innerHTML = '';
   document.body.style.overflow = '';
 }
@@ -150,7 +301,7 @@ function confirmar(titulo, texto, rotulo = 'Excluir') {
   return new Promise(ok => {
     abrirModal(`<h2>${esc(titulo)}</h2><p class="ajuda">${esc(texto)}</p>
       <div class="btn-linha"><button class="btn sec" data-r="0">Cancelar</button><button class="btn coral" data-r="1">${esc(rotulo)}</button></div>`,
-    m => m.querySelectorAll('[data-r]').forEach(b => b.addEventListener('click', () => { fecharModal(); ok(b.dataset.r === '1'); })));
+    m => m.querySelectorAll('[data-r]').forEach(b => b.addEventListener('click', () => { fecharModal(true); ok(b.dataset.r === '1'); })));
   });
 }
 const campo = (id, rotulo, valor = '', tipo = 'text', extra = '') =>
@@ -165,13 +316,15 @@ function limparErros(form) { form.querySelectorAll('.campo.invalido').forEach(c 
 /* ================= roteamento ================= */
 const rotas = {};
 function rota(nome, fn) { rotas[nome] = fn; }
-function ir(h) { if (location.hash === h) render(); else location.hash = h; }
-function render() {
+let rotaAtual = 'inicio', voltarAtual = null;
+function ir(h) { if (location.hash === h) render(); else location.replace(h); }
+function render(manterRolagem) {
   const partes = (location.hash || '#/inicio').slice(2).split('/');
-  const nome = partes[0] || 'inicio';
-  const fn = rotas[nome] || rotas.inicio;
+  const nome = rotas[partes[0]] ? partes[0] : 'inicio';
+  const fn = rotas[nome];
   const r = fn(partes[1]);
   if (!r) return;
+  rotaAtual = nome; voltarAtual = r.voltar || null;
   $('#tituloTela').textContent = r.titulo;
   $('#subtituloTela').textContent = r.subtitulo ?? E.config.associacao;
   const btn = $('#btnVoltar');
@@ -179,9 +332,45 @@ function render() {
   document.querySelectorAll('.abas a').forEach(a => a.classList.toggle('ativa', a.dataset.aba === r.aba));
   $('#app').innerHTML = r.html;
   if (r.depois) r.depois($('#app'));
-  window.scrollTo(0, 0);
+  if (!manterRolagem) window.scrollTo(0, 0);
 }
-window.addEventListener('hashchange', render);
+let rAgendado = false;
+function agendarRender() {  // atualizações vindas da nuvem: redesenha sem pular para o topo
+  if (rAgendado) return; rAgendado = true;
+  const f = () => { rAgendado = false; render(true); };
+  setTimeout(f, 30);
+}
+window.addEventListener('hashchange', () => { if (!$('#modal').hidden) fecharModal(true); render(); });
+// links internos não criam novas entradas no histórico
+document.addEventListener('click', ev => {
+  const a = ev.target.closest('a[href^="#/"]');
+  if (!a) return;
+  ev.preventDefault(); ir(a.getAttribute('href'));
+});
+
+/* ---------- botão voltar do celular: fecha janelas, volta telas e pergunta antes de sair ---------- */
+function prepararHistorico() {
+  history.replaceState({ base: 1 }, '', location.href);
+  history.pushState({ guarda: 1 }, '', location.href);
+}
+let saindo = false;
+window.addEventListener('popstate', ev => {
+  if (saindo || !(ev.state && ev.state.base)) return;
+  history.pushState({ guarda: 1 }, '', location.href);   // recoloca a proteção
+  const m = $('#modal');
+  if (!m.hidden) { if (!m.dataset.fixo && !m.dataset.saida) fecharModal(); return; }
+  if (voltarAtual) return ir(voltarAtual);
+  if (rotaAtual !== 'inicio') return ir('#/inicio');
+  confirmarSaida();
+});
+function confirmarSaida() {
+  abrirModal(`<h2>Sair do app?</h2><p class="ajuda">Seus dados continuam salvos${typeof Nuvem !== 'undefined' && Nuvem.ativa ? ' e sincronizados' : ' neste celular'}.</p>
+    <div class="btn-linha"><button class="btn" data-fechar>Continuar no app</button><button class="btn sec" id="sairApp">Sair</button></div>`,
+  m => {
+    m.dataset.saida = '1';
+    m.querySelector('#sairApp').onclick = () => { m.dataset.saida = ''; fecharModal(true); saindo = true; history.go(-2); setTimeout(() => { try { window.close(); } catch (e) {} saindo = false; }, 400); };
+  });
+}
 
 /* ================= INÍCIO ================= */
 rota('inicio', () => {
@@ -190,7 +379,7 @@ rota('inicio', () => {
   const evAno = E.eventos.filter(e => anoDe(e.data) === ano);
   const partAno = evAno.reduce((s, e) => s + participantes(e), 0);
   const tm = totaisMes(ym);
-  const semBackup = E.config.ultimoBackup ? (Date.now() - new Date(E.config.ultimoBackup)) / 864e5 > 30 : (E.alunos.length + E.eventos.length + E.lancamentos.length) > 0;
+  const semBackup = !Nuvem.ativa && (E.config.ultimoBackup ? (Date.now() - new Date(E.config.ultimoBackup)) / 864e5 > 30 : (E.alunos.length + E.eventos.length + E.lancamentos.length) > 0);
   return {
     titulo: 'Bairro Ativo', aba: 'inicio',
     html: `
@@ -211,7 +400,7 @@ rota('inicio', () => {
         <button class="btn sec" id="qSaida">+ Saída</button>
       </div>
       ${semBackup ? `<div class="card mt" style="border-color:var(--gold);background:var(--gold-soft)"><b>Faça uma cópia de segurança</b><p style="font-size:14px;margin:4px 0 10px">Os dados ficam só neste celular. Guarde uma cópia para não perder nada se trocar de aparelho.</p><a class="btn sec" href="#/relatorios">Ir para cópia de segurança</a></div>` : ''}
-      <p class="rodape-nota">Os dados ficam guardados somente neste celular.</p>`,
+      <p class="rodape-nota">${Nuvem.ativa ? `Sincronizado entre os celulares da associação · ${esc(Nuvem.user ? Nuvem.user.email : '')}` : 'Os dados ficam guardados somente neste celular.'}</p>`,
     depois: () => {
       $('#qAluno').onclick = () => formAluno(null, null);
       $('#qEvento').onclick = () => formEvento(null);
@@ -252,7 +441,7 @@ function formCurso(id) {
     const nome = f.nome.value.trim();
     if (!nome) return erroCampo(f, 'nome', 'Digite o nome do curso.');
     if (E.cursos.some(x => x.id !== id && x.nome.toLowerCase() === nome.toLowerCase())) return erroCampo(f, 'nome', 'Já existe um curso com esse nome.');
-    if (c) Object.assign(c, { nome, descricao: f.descricao.value.trim() });
+    if (c) Object.assign(curso(id) || c, { nome, descricao: f.descricao.value.trim() });
     else E.cursos.push({ id: uid(), nome, descricao: f.descricao.value.trim(), criadoEm: hoje() });
     await salvar(); fecharModal(); aviso(c ? 'Curso atualizado' : 'Curso cadastrado'); render();
   });
@@ -297,7 +486,7 @@ function formTurma(id, cursoId) {
     if (!d.nome) return erroCampo(f, 'nome', 'Digite o nome da turma.');
     if (!d.inicio) return erroCampo(f, 'inicio', 'Informe a data de início.');
     if (d.fim && d.fim < d.inicio) return erroCampo(f, 'fim', 'O fim precisa ser depois do início.');
-    if (t) Object.assign(t, d); else E.turmas.push({ id: uid(), cursoId, ...d });
+    if (t) Object.assign(turma(id) || t, d); else E.turmas.push({ id: uid(), cursoId, ...d });
     await salvar(); fecharModal(); aviso(t ? 'Turma atualizada' : 'Turma criada'); render();
   });
 }
@@ -374,7 +563,7 @@ function formAluno(id, turmaId) {
       if (d.cpf && !cpfValido(d.cpf)) return erroCampo(f, 'cpf', 'CPF inválido. Confira os números ou deixe em branco.');
       if (d.cpf && E.alunos.some(x => x.id !== id && x.cpf === d.cpf)) return erroCampo(f, 'cpf', 'Já existe um aluno com este CPF.');
       let alvo = a;
-      if (a) Object.assign(a, d); else { alvo = { id: uid(), ...d, criadoEm: hoje() }; E.alunos.push(alvo); }
+      if (a) { alvo = aluno(id) || a; Object.assign(alvo, d); } else { alvo = { id: uid(), ...d, criadoEm: hoje() }; E.alunos.push(alvo); }
       const tId = turmaId || (f.turma && f.turma.value);
       if (!a && tId) E.matriculas.push({ id: uid(), turmaId: tId, alunoId: alvo.id, data: hoje() });
       await salvar(); fecharModal(); aviso(a ? 'Aluno atualizado' : (tId ? 'Aluno cadastrado e matriculado' : 'Aluno cadastrado')); render();
@@ -486,7 +675,7 @@ function formEvento(id) {
         if (!Number.isInteger(q) || q < 0) return erroCampo(f, 'quantidade', 'Use um número inteiro, como 180.');
         d.quantidade = q; d.nomes = [];
       } else { d.nomes = nomes; d.quantidade = nomes.length; }
-      if (e) Object.assign(e, d); else E.eventos.push({ id: uid(), ...d });
+      if (e) Object.assign(evento(id) || e, d); else E.eventos.push({ id: uid(), ...d });
       anoEventos = anoDe(d.data);
       await salvar(); fecharModal(); aviso(e ? 'Evento atualizado' : 'Evento registrado'); render();
     };
@@ -596,7 +785,7 @@ function formLancamento(id, tipoNovo, eventoNovo) {
       if (!(valor > 0)) return erroCampo(f, 'valor', 'Digite um valor maior que zero, como 25,50.');
       if (!f.data.value) return erroCampo(f, 'data', 'Informe a data.');
       const d = { tipo: f.tipo.value, valor, data: f.data.value, categoria: f.categoria.value, forma: f.forma.value, descricao: f.descricao.value.trim(), eventoId: f.evento ? (f.evento.value || null) : null };
-      if (l) Object.assign(l, d); else E.lancamentos.push({ id: uid(), ...d, criadoEm: new Date().toISOString() });
+      if (l) Object.assign(E.lancamentos.find(x => x.id === id) || l, d); else E.lancamentos.push({ id: uid(), ...d, criadoEm: new Date().toISOString() });
       mesCaixa = mesDe(d.data);
       await salvar(); fecharModal(); aviso(l ? 'Lançamento atualizado' : (d.tipo === 'entrada' ? 'Entrada registrada' : 'Saída registrada')); render();
     };
@@ -604,56 +793,84 @@ function formLancamento(id, tipoNovo, eventoNovo) {
 }
 
 /* ================= RELATÓRIOS ================= */
-let anoRel = new Date().getFullYear(), mesRel = mesDe(hoje());
-function dadosAnuais(ano) {
-  const ts = E.turmas.filter(t => turmaNoAno(t, ano));
+const TIPOS_REL = [
+  { id: 'geral', nome: 'Geral', desc: 'Cursos, eventos e caixa' },
+  { id: 'cursos', nome: 'Cursos', desc: 'Turmas e alunos' },
+  { id: 'eventos', nome: 'Eventos', desc: 'Participantes e arrecadação' },
+  { id: 'caixa', nome: 'Caixa', desc: 'Todas as entradas e saídas' },
+  { id: 'bazar', nome: 'Bazar', desc: 'Só o que entrou do bazar' }
+];
+const Rel = { tipo: 'geral', periodo: 'mes', ano: new Date().getFullYear(), mes: mesDe(hoje()) };
+const relRotulo = () => Rel.periodo === 'ano' ? String(Rel.ano) : nomeMesTitulo(Rel.mes);
+const relDentro = iso => !!iso && (Rel.periodo === 'ano' ? anoDe(iso) === Rel.ano : mesDe(iso) === Rel.mes);
+function relLimites() {
+  if (Rel.periodo === 'ano') return [`${Rel.ano}-01-01`, `${Rel.ano}-12-31`];
+  const [a, m] = Rel.mes.split('-').map(Number);
+  return [`${Rel.mes}-01`, `${Rel.mes}-${String(new Date(a, m, 0).getDate()).padStart(2, '0')}`];
+}
+function dadosRel() {
+  const [ini, fim] = relLimites();
+  const ts = E.turmas.filter(t => { const i = t.inicio || t.fim, f = t.fim || t.inicio; return i && i <= fim && f >= ini; });
   const porCurso = E.cursos.map(c => {
-    const tc = ts.filter(t => t.cursoId === c.id);
+    const tc = ts.filter(t => t.cursoId === c.id).sort((a, b) => (a.inicio || '').localeCompare(b.inicio || ''));
     const alunos = new Set(E.matriculas.filter(m => tc.some(t => t.id === m.turmaId)).map(m => m.alunoId));
-    return { nome: c.nome, turmas: tc.length, alunos: alunos.size };
-  }).filter(c => c.turmas > 0).sort((a, b) => b.alunos - a.alunos);
+    return { curso: c, nome: c.nome, turmas: tc, alunos: alunos.size };
+  }).filter(c => c.turmas.length > 0).sort((a, b) => b.alunos - a.alunos || a.nome.localeCompare(b.nome, 'pt-BR'));
   const alunosUnicos = new Set(E.matriculas.filter(m => ts.some(t => t.id === m.turmaId)).map(m => m.alunoId)).size;
-  const evs = E.eventos.filter(e => anoDe(e.data) === ano).sort((a, b) => a.data.localeCompare(b.data));
+  const evs = E.eventos.filter(e => relDentro(e.data)).sort((a, b) => a.data.localeCompare(b.data));
   const part = evs.reduce((s, e) => s + participantes(e), 0);
-  const ls = E.lancamentos.filter(l => anoDe(l.data) === ano);
+  const ls = E.lancamentos.filter(l => relDentro(l.data)).sort((a, b) => a.data.localeCompare(b.data));
   const ent = ls.filter(l => l.tipo === 'entrada').reduce((s, l) => s + l.valor, 0);
   const sai = ls.filter(l => l.tipo === 'saida').reduce((s, l) => s + l.valor, 0);
-  return { ano, porCurso, turmas: ts.length, alunosUnicos, evs, part, ent, sai };
+  const bazar = ls.filter(l => l.tipo === 'entrada' && l.categoria === 'Bazar');
+  const totBazar = bazar.reduce((s, l) => s + l.valor, 0), diasBazar = new Set(bazar.map(l => l.data)).size;
+  return { ts, porCurso, alunosUnicos, evs, part, ls, ent, sai, bazar, totBazar, diasBazar };
+}
+function resumoRel(d) {
+  const b = (v, l, c = '') => `<div class="bloco ${c}"><div class="v" style="font-size:${String(v).length > 7 ? 18 : 24}px">${v}</div><div class="l">${l}</div></div>`;
+  switch (Rel.tipo) {
+    case 'cursos': return b(d.porCurso.length, 'cursos') + b(d.ts.length, 'turmas') + b(d.alunosUnicos, 'alunos atendidos', 'gold');
+    case 'eventos': return b(d.evs.length, 'eventos', 'coral') + b(d.part, 'participações') + b(reais(d.ls.filter(l => l.tipo === 'entrada' && l.eventoId).reduce((s, l) => s + l.valor, 0)), 'arrecadado em eventos', 'gold');
+    case 'caixa': return b(reais(d.ent), 'entradas') + b(reais(d.sai), 'saídas', 'coral') + b(reais(d.ent - d.sai), 'saldo', 'gold') + b(d.ls.length, 'lançamentos');
+    case 'bazar': return b(reais(d.totBazar), 'arrecadado no bazar', 'gold') + b(d.diasBazar, 'dias de bazar') + b(reais(d.diasBazar ? d.totBazar / d.diasBazar : 0), 'média por dia');
+    default: return b(d.porCurso.length, 'cursos') + b(d.alunosUnicos, 'alunos atendidos', 'gold') + b(d.evs.length, 'eventos', 'coral') + b(d.part, 'participações') + b(reais(d.ent - d.sai), 'saldo do caixa');
+  }
 }
 
 rota('relatorios', () => {
-  const a = dadosAnuais(anoRel), t = totaisMes(mesRel);
+  const d = dadosRel();
+  const contaNuvem = typeof Nuvem !== 'undefined' && Nuvem.ativa && Nuvem.user;
   return {
     titulo: 'Relatórios', aba: 'relatorios',
-    html: `<p class="secao">Relatório anual</p>
-      <div class="periodo"><button id="aAnt" aria-label="Ano anterior">‹</button><b>${anoRel}</b><button id="aProx" aria-label="Próximo ano">›</button></div>
-      <div class="blocos"><div class="bloco"><div class="v">${a.porCurso.length}</div><div class="l">cursos · ${a.turmas} turma(s)</div></div><div class="bloco gold"><div class="v">${a.alunosUnicos}</div><div class="l">alunos atendidos</div></div>
-      <div class="bloco coral"><div class="v">${a.evs.length}</div><div class="l">eventos</div></div><div class="bloco"><div class="v">${a.part}</div><div class="l">participações</div></div></div>
-      <div class="acoes"><button class="btn" id="pdfAno">Gerar PDF do ano</button></div>
-
-      <p class="secao" style="margin-top:28px">Relatório do caixa (para o contador)</p>
-      <div class="periodo"><button id="mAnt" aria-label="Mês anterior">‹</button><b>${nomeMesTitulo(mesRel)}</b><button id="mProx" aria-label="Próximo mês">›</button></div>
-      <div class="card"><dl class="info"><dt>Entradas</dt><dd>${reais(t.ent)}</dd><dt>Saídas</dt><dd>${reais(t.sai)}</dd><dt>Saldo</dt><dd>${reais(t.saldo)}</dd><dt>Lançamentos</dt><dd>${t.ls.length}</dd></dl></div>
-      <div class="acoes"><button class="btn" id="pdfMes">Gerar PDF do mês</button></div>
+    html: `<p class="secao">Qual relatório?</p>
+      <div class="tipos">${TIPOS_REL.map(x => `<button class="tipo ${Rel.tipo === x.id ? 'ativo' : ''}" data-tipo="${x.id}"><b>${x.nome}</b><span>${x.desc}</span></button>`).join('')}</div>
+      <p class="secao" style="margin-top:20px">Período</p>
+      <div class="segmento"><button data-per="mes" class="${Rel.periodo === 'mes' ? 'ativo' : ''}">Mês</button><button data-per="ano" class="${Rel.periodo === 'ano' ? 'ativo' : ''}">Ano</button></div>
+      <div class="periodo"><button id="pAnt" aria-label="Período anterior">‹</button><b>${relRotulo()}</b><button id="pProx" aria-label="Próximo período">›</button></div>
+      <div class="blocos">${resumoRel(d)}</div>
+      <div class="acoes"><button class="btn" id="gerarPdf">Gerar PDF: ${TIPOS_REL.find(x => x.id === Rel.tipo).nome} · ${relRotulo()}</button></div>
 
       <p class="secao" style="margin-top:28px">Cópia de segurança</p>
-      <div class="card"><p style="font-size:15px">Os dados ficam só neste celular. Salve uma cópia no WhatsApp, no Google Drive ou no e-mail para recuperar tudo se trocar de aparelho.</p>
+      <div class="card"><p style="font-size:15px">${contaNuvem ? 'Os dados ficam guardados na nuvem e em cada celular conectado. Uma cópia extra em arquivo ainda é recomendada.' : 'Os dados ficam só neste celular. Salve uma cópia no WhatsApp, no Google Drive ou no e-mail para recuperar tudo se trocar de aparelho.'}</p>
       <p style="font-size:14px;color:var(--muted);margin-top:6px">Última cópia: ${E.config.ultimoBackup ? new Date(E.config.ultimoBackup).toLocaleDateString('pt-BR') : 'nunca'}</p></div>
       <div class="acoes"><button class="btn" id="backup">Salvar cópia de segurança</button><button class="btn sec" id="restaurar">Recuperar de uma cópia</button></div>
       <input type="file" id="arquivo" accept=".json,application/json" hidden>
 
       <p class="secao" style="margin-top:28px">Configuração</p>
-      <div class="acoes" style="margin-top:0"><button class="btn sec" id="cfg">Nome da associação</button></div>
+      ${contaNuvem ? `<div class="card"><dl class="info"><dt>Conectado como</dt><dd>${esc(Nuvem.user.email)}</dd><dt>Sincronização</dt><dd id="statusTxt">${Nuvem.textoStatus()}</dd></dl></div>` : ''}
+      <div class="acoes" style="margin-top:10px"><button class="btn sec" id="cfg">Nome da associação</button>${contaNuvem ? '<button class="btn perigo" id="logout">Sair da conta neste celular</button>' : ''}</div>
       <p class="rodape-nota">Bairro Ativo · prática extensionista ADS PUCPR</p>`,
-    depois: () => {
-      $('#aAnt').onclick = () => { anoRel--; render(); }; $('#aProx').onclick = () => { anoRel++; render(); };
-      $('#mAnt').onclick = () => { mesRel = somaMes(mesRel, -1); render(); }; $('#mProx').onclick = () => { mesRel = somaMes(mesRel, 1); render(); };
-      $('#pdfAno').onclick = () => pdfAnual(anoRel);
-      $('#pdfMes').onclick = () => pdfMensal(mesRel);
+    depois: r => {
+      r.querySelectorAll('[data-tipo]').forEach(b => b.onclick = () => { Rel.tipo = b.dataset.tipo; render(true); });
+      r.querySelectorAll('[data-per]').forEach(b => b.onclick = () => { Rel.periodo = b.dataset.per; render(true); });
+      $('#pAnt').onclick = () => { if (Rel.periodo === 'ano') Rel.ano--; else Rel.mes = somaMes(Rel.mes, -1); render(true); };
+      $('#pProx').onclick = () => { if (Rel.periodo === 'ano') Rel.ano++; else Rel.mes = somaMes(Rel.mes, 1); render(true); };
+      $('#gerarPdf').onclick = () => gerarPDF();
       $('#backup').onclick = exportarBackup;
       $('#restaurar').onclick = () => $('#arquivo').click();
       $('#arquivo').onchange = ev => importarBackup(ev.target.files[0]);
       $('#cfg').onclick = formConfig;
+      const lo = $('#logout'); if (lo) lo.onclick = () => Nuvem.sair();
     }
   };
 });
@@ -664,7 +881,7 @@ function formConfig() {
   m => m.querySelector('#f').onsubmit = async ev => {
     ev.preventDefault(); const v = ev.target.assoc.value.trim();
     if (!v) return erroCampo(ev.target, 'assoc', 'Digite o nome.');
-    E.config.associacao = v; await salvar(); fecharModal(); aviso('Nome atualizado'); render();
+    E.config.associacao = v; Nuvem.salvarNome(v); await salvar(); fecharModal(); aviso('Nome atualizado'); render();
   });
 }
 
@@ -733,39 +950,82 @@ async function entregarPDF(doc, nome) {
   setTimeout(() => URL.revokeObjectURL(url), 4000); aviso('PDF salvo em Downloads');
 }
 
-function pdfAnual(ano) {
-  const a = dadosAnuais(ano), p = novoPDF(`Relatório anual ${ano}`, E.config.associacao); if (!p) return;
-  pdfSecao(p, 'Resumo do ano');
-  pdfBlocos(p, [{ v: a.porCurso.length, l: 'cursos oferecidos' }, { v: a.turmas, l: 'turmas' }, { v: a.alunosUnicos, l: 'alunos atendidos', cor: [253, 241, 214] }, { v: a.evs.length, l: 'eventos', cor: [253, 230, 224] }, { v: a.part, l: 'participações' }]);
-  pdfSecao(p, 'Cursos');
-  pdfTabela(p, ['Curso', 'Turmas', 'Alunos'], a.porCurso.map(c => [c.nome, c.turmas, c.alunos]), [120, 30, 30], ['', 'r', 'r']);
-  pdfSecao(p, 'Eventos');
-  pdfTabela(p, ['Data', 'Evento', 'Local', 'Participantes'], a.evs.map(e => [dataBR(e.data), e.nome, e.local || '—', participantes(e)]), [25, 85, 40, 30], ['', '', '', 'r']);
-  pdfSecao(p, 'Caixa no ano');
-  pdfTabela(p, ['Item', 'Valor'], [['Total de entradas', reais(a.ent)], ['Total de saídas', reais(a.sai)], ['Saldo do ano', reais(a.ent - a.sai)]], [130, 50], ['', 'r']);
-  pdfRodape(p.doc); entregarPDF(p.doc, `relatorio-anual-${ano}.pdf`);
-}
+function gerarPDF() {
+  const d = dadosRel(), tipo = TIPOS_REL.find(x => x.id === Rel.tipo), rot = relRotulo();
+  const titulo = tipo.id === 'geral' ? `Relatório geral – ${rot}` : `Relatório de ${tipo.nome.toLowerCase()} – ${rot}`;
+  const p = novoPDF(titulo, E.config.associacao); if (!p) return;
+  const quem = typeof Nuvem !== 'undefined' && Nuvem.ativa;
+  const secCursos = (detalhe) => {
+    pdfSecao(p, 'Cursos');
+    pdfTabela(p, ['Curso', 'Turmas', 'Alunos'], d.porCurso.map(c => [c.nome, c.turmas.length, c.alunos]), [120, 30, 30], ['', 'r', 'r']);
+    if (!detalhe) return;
+    pdfSecao(p, 'Turmas no período');
+    const linhas = [];
+    d.porCurso.forEach(c => c.turmas.forEach(t => linhas.push([c.nome, t.nome, `${dataBR(t.inicio)} a ${dataBR(t.fim)}`, t.horario || '—', alunosDaTurma(t.id).length])));
+    pdfTabela(p, ['Curso', 'Turma', 'Período', 'Horário', 'Alunos'], linhas, [45, 30, 45, 40, 20], ['', '', '', '', 'r']);
+    d.porCurso.forEach(c => c.turmas.forEach(t => {
+      const al = alunosDaTurma(t.id); if (!al.length) return;
+      pdfSecao(p, `Alunos – ${c.nome} (${t.nome})`);
+      pdfTabela(p, ['Nº', 'Nome', 'Bairro'], al.map((a, i) => [i + 1, a.nome, a.bairro || '—']), [15, 115, 50], ['r', '', '']);
+    }));
+  };
+  const secEventos = (comArrec) => {
+    pdfSecao(p, 'Eventos');
+    const arrec = id => d.ls.filter(l => l.tipo === 'entrada' && l.eventoId === id).reduce((s, l) => s + l.valor, 0);
+    pdfTabela(p, comArrec ? ['Data', 'Evento', 'Local', 'Particip.', 'Arrecadado'] : ['Data', 'Evento', 'Local', 'Participantes'],
+      d.evs.map(e => comArrec ? [dataBR(e.data), e.nome, e.local || '—', participantes(e), reais(arrec(e.id))] : [dataBR(e.data), e.nome, e.local || '—', participantes(e)]),
+      comArrec ? [22, 68, 35, 22, 33] : [25, 85, 40, 30], comArrec ? ['', '', '', 'r', 'r'] : ['', '', '', 'r']);
+  };
+  const linhaLanc = l => [dataBR(l.data), l.tipo === 'entrada' ? 'Entrada' : 'Saída', `${l.categoria}${l.descricao ? ' – ' + l.descricao : ''}${l.eventoId && evento(l.eventoId) ? ' (' + evento(l.eventoId).nome + ')' : ''}${quem && l._por ? ' · ' + l._por.split('@')[0] : ''}`, l.forma === 'especie' ? 'Espécie' : 'Conta', (l.tipo === 'saida' ? '- ' : '') + reais(l.valor)];
 
-function pdfMensal(ym) {
-  const t = totaisMes(ym), p = novoPDF(`Caixa de ${nomeMes(ym)}`, E.config.associacao); if (!p) return;
-  pdfSecao(p, 'Resumo do mês');
-  pdfBlocos(p, [{ v: reais(t.ent), l: 'entradas' }, { v: reais(t.sai), l: 'saídas', cor: [253, 230, 224] }, { v: reais(t.saldo), l: 'saldo do mês', cor: [253, 241, 214] }]);
-  const porCat = {};
-  t.ls.forEach(l => { const k = `${l.tipo === 'entrada' ? 'Entrada' : 'Saída'} · ${l.categoria}`; porCat[k] = (porCat[k] || 0) + l.valor; });
-  pdfSecao(p, 'Por categoria');
-  pdfTabela(p, ['Categoria', 'Total'], Object.entries(porCat).sort().map(([k, v]) => [k, reais(v)]), [130, 50], ['', 'r']);
-  const forma = f => t.ls.reduce((s, l) => s + (l.forma === f ? (l.tipo === 'entrada' ? l.valor : -l.valor) : 0), 0);
-  pdfSecao(p, 'Por forma');
-  pdfTabela(p, ['Forma', 'Movimento líquido'], [['Espécie', reais(forma('especie'))], ['Conta bancária', reais(forma('conta'))]], [130, 50], ['', 'r']);
-  pdfSecao(p, 'Lançamentos');
-  const ls = [...t.ls].sort((a, b) => a.data.localeCompare(b.data));
-  pdfTabela(p, ['Data', 'Tipo', 'Categoria / descrição', 'Forma', 'Valor'],
-    ls.map(l => [dataBR(l.data), l.tipo === 'entrada' ? 'Entrada' : 'Saída', `${l.categoria}${l.descricao ? ' – ' + l.descricao : ''}${l.eventoId && evento(l.eventoId) ? ' (' + evento(l.eventoId).nome + ')' : ''}`, l.forma === 'especie' ? 'Espécie' : 'Conta', (l.tipo === 'saida' ? '- ' : '') + reais(l.valor)]),
-    [22, 20, 83, 22, 33], ['', '', '', '', 'r']);
-  pdfPagina(p, 20);
-  p.doc.setFontSize(9); p.doc.setTextColor(...COR.muted);
-  p.doc.text('Relatório de apoio para conferência com as notas enviadas ao contador.', 15, p.y + 4);
-  pdfRodape(p.doc); entregarPDF(p.doc, `caixa-${ym}.pdf`);
+  if (tipo.id === 'geral') {
+    pdfSecao(p, 'Resumo');
+    pdfBlocos(p, [{ v: d.porCurso.length, l: 'cursos' }, { v: d.ts.length, l: 'turmas' }, { v: d.alunosUnicos, l: 'alunos atendidos', cor: [253, 241, 214] }, { v: d.evs.length, l: 'eventos', cor: [253, 230, 224] }, { v: d.part, l: 'participações' }]);
+    secCursos(false); secEventos(false);
+    pdfSecao(p, 'Caixa');
+    pdfTabela(p, ['Item', 'Valor'], [['Total de entradas', reais(d.ent)], ['Total de saídas', reais(d.sai)], ['Saldo do período', reais(d.ent - d.sai)], ['Arrecadado no bazar', reais(d.totBazar)]], [130, 50], ['', 'r']);
+  } else if (tipo.id === 'cursos') {
+    pdfSecao(p, 'Resumo');
+    pdfBlocos(p, [{ v: d.porCurso.length, l: 'cursos' }, { v: d.ts.length, l: 'turmas' }, { v: d.alunosUnicos, l: 'alunos atendidos', cor: [253, 241, 214] }]);
+    secCursos(true);
+  } else if (tipo.id === 'eventos') {
+    pdfSecao(p, 'Resumo');
+    pdfBlocos(p, [{ v: d.evs.length, l: 'eventos', cor: [253, 230, 224] }, { v: d.part, l: 'participações' }]);
+    secEventos(true);
+  } else if (tipo.id === 'caixa') {
+    pdfSecao(p, 'Resumo');
+    pdfBlocos(p, [{ v: reais(d.ent), l: 'entradas' }, { v: reais(d.sai), l: 'saídas', cor: [253, 230, 224] }, { v: reais(d.ent - d.sai), l: 'saldo', cor: [253, 241, 214] }]);
+    const porCat = {};
+    d.ls.forEach(l => { const k = `${l.tipo === 'entrada' ? 'Entrada' : 'Saída'} · ${l.categoria}`; porCat[k] = (porCat[k] || 0) + l.valor; });
+    pdfSecao(p, 'Por categoria');
+    pdfTabela(p, ['Categoria', 'Total'], Object.entries(porCat).sort().map(([k, v]) => [k, reais(v)]), [130, 50], ['', 'r']);
+    const forma = f => d.ls.reduce((s, l) => s + (l.forma === f ? (l.tipo === 'entrada' ? l.valor : -l.valor) : 0), 0);
+    pdfSecao(p, 'Por forma');
+    pdfTabela(p, ['Forma', 'Movimento líquido'], [['Espécie', reais(forma('especie'))], ['Conta bancária', reais(forma('conta'))]], [130, 50], ['', 'r']);
+    pdfSecao(p, 'Lançamentos');
+    pdfTabela(p, ['Data', 'Tipo', 'Categoria / descrição', 'Forma', 'Valor'], d.ls.map(linhaLanc), [22, 20, 83, 22, 33], ['', '', '', '', 'r']);
+    pdfPagina(p, 20); p.doc.setFontSize(9); p.doc.setTextColor(...COR.muted);
+    p.doc.text('Relatório de apoio para conferência com as notas enviadas ao contador.', 15, p.y + 4);
+  } else if (tipo.id === 'bazar') {
+    pdfSecao(p, 'Resumo');
+    pdfBlocos(p, [{ v: reais(d.totBazar), l: 'arrecadado no bazar', cor: [253, 241, 214] }, { v: d.diasBazar, l: 'dias de bazar' }, { v: reais(d.diasBazar ? d.totBazar / d.diasBazar : 0), l: 'média por dia' }]);
+    if (Rel.periodo === 'ano') {
+      pdfSecao(p, 'Por mês');
+      const linhas = [];
+      for (let m = 1; m <= 12; m++) {
+        const ym = `${Rel.ano}-${String(m).padStart(2, '0')}`, bl = d.bazar.filter(l => mesDe(l.data) === ym);
+        if (bl.length) linhas.push([nomeMesTitulo(ym), new Set(bl.map(l => l.data)).size, reais(bl.reduce((s, l) => s + l.valor, 0))]);
+      }
+      pdfTabela(p, ['Mês', 'Dias de bazar', 'Total'], linhas, [90, 40, 50], ['', 'r', 'r']);
+    }
+    const forma = f => d.bazar.filter(l => l.forma === f).reduce((s, l) => s + l.valor, 0);
+    pdfSecao(p, 'Por forma');
+    pdfTabela(p, ['Forma', 'Total'], [['Espécie', reais(forma('especie'))], ['Conta bancária', reais(forma('conta'))]], [130, 50], ['', 'r']);
+    pdfSecao(p, 'Lançamentos do bazar');
+    pdfTabela(p, ['Data', 'Descrição', 'Forma', 'Valor'], d.bazar.map(l => [dataBR(l.data), (l.descricao || 'Bazar') + (quem && l._por ? ' · ' + l._por.split('@')[0] : ''), l.forma === 'especie' ? 'Espécie' : 'Conta', reais(l.valor)]), [25, 100, 25, 30], ['', '', '', 'r']);
+  }
+  const arq = `${tipo.id}-${Rel.periodo === 'ano' ? Rel.ano : Rel.mes}.pdf`;
+  pdfRodape(p.doc); entregarPDF(p.doc, arq);
 }
 
 /* ---------- backup ---------- */
@@ -788,8 +1048,10 @@ async function importarBackup(arquivo) {
   const ok = dados && ['cursos', 'turmas', 'alunos', 'matriculas', 'eventos', 'lancamentos'].every(k => Array.isArray(dados[k]));
   if (!ok) return aviso('Este arquivo não é uma cópia do Bairro Ativo.');
   const resumo = `${dados.cursos.length} curso(s), ${dados.alunos.length} aluno(s), ${dados.eventos.length} evento(s) e ${dados.lancamentos.length} lançamento(s).`;
-  if (await confirmar('Recuperar esta cópia?', `Os dados atuais deste celular serão substituídos por: ${resumo}`, 'Recuperar')) {
+  if (await confirmar('Recuperar esta cópia?', `Os dados atuais ${Nuvem.ativa ? 'de TODOS os celulares conectados' : 'deste celular'} serão substituídos por: ${resumo}`, 'Recuperar')) {
+    const cfgAtual = E.config;
     E = Object.assign(estadoVazio(), dados); E.config = Object.assign(estadoVazio().config, dados.config || {});
+    if (Nuvem.ativa) { E.config.ultimoBackup = cfgAtual.ultimoBackup; Nuvem.salvarNome(E.config.associacao); }
     await salvar(); aviso('Dados recuperados'); ir('#/inicio');
   }
   $('#arquivo') && ($('#arquivo').value = '');
@@ -803,6 +1065,8 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal
   const salvo = await Banco.ler();
   if (salvo) { E = Object.assign(estadoVazio(), salvo); E.config = Object.assign(estadoVazio().config, salvo.config || {}); }
   if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch (e) { /* opcional */ } }
+  prepararHistorico();
   render();
+  if (Nuvem.configurada()) { Nuvem.localInicial = JSON.parse(JSON.stringify(E)); Nuvem.iniciar(); }
   if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
 })();

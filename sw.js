@@ -1,13 +1,17 @@
 /* Service worker do Bairro Ativo: guarda os arquivos do app para funcionar sem internet.
    Ao publicar uma nova versão, aumente o número em VERSAO. */
-const VERSAO = 'bairro-ativo-v1';
+const VERSAO = 'bairro-ativo-v3';
 const ARQUIVOS = [
   './',
   './index.html',
   './styles.css',
   './app.js',
   './manifest.webmanifest',
+  './firebase-config.js',
   './vendor/jspdf.umd.min.js',
+  './vendor/firebase-app-compat.js',
+  './vendor/firebase-auth-compat.js',
+  './vendor/firebase-firestore-compat.js',
   './icons/icon-192.png',
   './icons/icon-512.png'
 ];
