@@ -316,15 +316,20 @@ function limparErros(form) { form.querySelectorAll('.campo.invalido').forEach(c 
 /* ================= roteamento ================= */
 const rotas = {};
 function rota(nome, fn) { rotas[nome] = fn; }
-let rotaAtual = 'inicio', voltarAtual = null;
-function ir(h) { if (location.hash === h) render(); else location.replace(h); }
+let rotaAtual = 'inicio', voltarAtual = null, hashAtual = location.hash || '#/inicio';
+// navegação interna: troca a tela sem criar entradas novas no histórico do navegador
+function ir(h) {
+  if (location.hash !== h) history.replaceState(history.state, '', h);
+  if (!$('#modal').hidden && !$('#modal').dataset.fixo) fecharModal(true);
+  render();
+}
 function render(manterRolagem) {
   const partes = (location.hash || '#/inicio').slice(2).split('/');
   const nome = rotas[partes[0]] ? partes[0] : 'inicio';
   const fn = rotas[nome];
   const r = fn(partes[1]);
   if (!r) return;
-  rotaAtual = nome; voltarAtual = r.voltar || null;
+  rotaAtual = nome; voltarAtual = r.voltar || null; hashAtual = location.hash || '#/inicio';
   $('#tituloTela').textContent = r.titulo;
   $('#subtituloTela').textContent = r.subtitulo ?? E.config.associacao;
   const btn = $('#btnVoltar');
@@ -340,7 +345,8 @@ function agendarRender() {  // atualizações vindas da nuvem: redesenha sem pul
   const f = () => { rAgendado = false; render(true); };
   setTimeout(f, 30);
 }
-window.addEventListener('hashchange', () => { if (!$('#modal').hidden) fecharModal(true); render(); });
+let ignorarHash = false;
+window.addEventListener('hashchange', () => { if (ignorarHash) return; if (!$('#modal').hidden && !$('#modal').dataset.fixo) fecharModal(true); render(); });
 // links internos não criam novas entradas no histórico
 document.addEventListener('click', ev => {
   const a = ev.target.closest('a[href^="#/"]');
@@ -348,27 +354,47 @@ document.addEventListener('click', ev => {
   ev.preventDefault(); ir(a.getAttribute('href'));
 });
 
-/* ---------- botão voltar do celular: fecha janelas, volta telas e pergunta antes de sair ---------- */
-function prepararHistorico() {
-  history.replaceState({ base: 1 }, '', location.href);
-  history.pushState({ guarda: 1 }, '', location.href);
+/* ---------- botão voltar do celular: fecha janelas, volta telas e pergunta antes de sair ----------
+   O Chrome do Android ignora no botão voltar as entradas de histórico criadas sem um toque do usuário.
+   Por isso as "proteções" (até 3) são recolocadas a cada toque ou tecla, e não só ao abrir o app. */
+const MAX_GUARDAS = 3;
+let guardas = 0, saindo = false;
+function prepararHistorico() { history.replaceState({ base: 1 }, '', location.href); guardas = 0; }
+function reabastecerGuardas() {
+  if (saindo) return;
+  while (guardas < MAX_GUARDAS) { history.pushState({ guarda: 1 }, '', location.href); guardas++; }
 }
-let saindo = false;
+document.addEventListener('click', reabastecerGuardas, true);
+document.addEventListener('keydown', reabastecerGuardas, true);
+document.addEventListener('touchend', reabastecerGuardas, true);
 window.addEventListener('popstate', ev => {
-  if (saindo || !(ev.state && ev.state.base)) return;
-  history.pushState({ guarda: 1 }, '', location.href);   // recoloca a proteção
+  if (saindo || !ev.state || !(ev.state.base || ev.state.guarda)) return;
+  guardas = ev.state.base ? 0 : Math.max(0, guardas - 1);
+  // mantém a tela atual: o botão voltar é tratado pelo app, não pelo endereço
+  ignorarHash = true; setTimeout(() => { ignorarHash = false; }, 0);
+  if (location.hash !== hashAtual) history.replaceState(ev.state, '', hashAtual);
   const m = $('#modal');
-  if (!m.hidden) { if (!m.dataset.fixo && !m.dataset.saida) fecharModal(); return; }
+  if (!m.hidden) {
+    if (m.dataset.saida) return sairDoApp();          // voltar de novo na pergunta = sair
+    if (!m.dataset.fixo) fecharModal(true);
+    return;
+  }
   if (voltarAtual) return ir(voltarAtual);
   if (rotaAtual !== 'inicio') return ir('#/inicio');
   confirmarSaida();
 });
+function sairDoApp() {
+  const m = $('#modal'); m.dataset.saida = ''; fecharModal(true);
+  saindo = true;
+  history.go(-(guardas + 1));
+  setTimeout(() => { try { window.close(); } catch (e) { /* ignora */ } history.back(); }, 350);
+}
 function confirmarSaida() {
   abrirModal(`<h2>Sair do app?</h2><p class="ajuda">Seus dados continuam salvos${typeof Nuvem !== 'undefined' && Nuvem.ativa ? ' e sincronizados' : ' neste celular'}.</p>
     <div class="btn-linha"><button class="btn" data-fechar>Continuar no app</button><button class="btn sec" id="sairApp">Sair</button></div>`,
   m => {
     m.dataset.saida = '1';
-    m.querySelector('#sairApp').onclick = () => { m.dataset.saida = ''; fecharModal(true); saindo = true; history.go(-2); setTimeout(() => { try { window.close(); } catch (e) {} saindo = false; }, 400); };
+    m.querySelector('#sairApp').onclick = sairDoApp;
   });
 }
 
