@@ -360,8 +360,8 @@ document.addEventListener('click', ev => {
 const MAX_GUARDAS = 3;
 let guardas = 0, saindo = false;
 function prepararHistorico() { history.replaceState({ base: 1 }, '', location.href); guardas = 0; }
-function reabastecerGuardas() {
-  if (saindo) return;
+function reabastecerGuardas(ev) {
+  if (saindo || (ev && ev.target && ev.target.closest && ev.target.closest('#sairApp'))) return;
   while (guardas < MAX_GUARDAS) { history.pushState({ guarda: 1 }, '', location.href); guardas++; }
 }
 document.addEventListener('click', reabastecerGuardas, true);
@@ -384,10 +384,15 @@ window.addEventListener('popstate', ev => {
   confirmarSaida();
 });
 function sairDoApp() {
+  // O Android não deixa um app da web se fechar por código. O app tira as proteções do
+  // histórico e o próximo toque em "voltar" fecha o app normalmente.
   const m = $('#modal'); m.dataset.saida = ''; fecharModal(true);
+  try { window.close(); } catch (e) { /* ignora */ }
   saindo = true;
-  history.go(-(guardas + 1));
-  setTimeout(() => { try { window.close(); } catch (e) { /* ignora */ } history.back(); }, 350);
+  if (guardas > 0) history.go(-guardas);
+  guardas = 0;
+  setTimeout(() => { saindo = false; }, 800);
+  setTimeout(() => aviso('Toque em voltar mais uma vez para fechar o app.'), 120);
 }
 function confirmarSaida() {
   abrirModal(`<h2>Sair do app?</h2><p class="ajuda">Seus dados continuam salvos${typeof Nuvem !== 'undefined' && Nuvem.ativa ? ' e sincronizados' : ' neste celular'}.</p>

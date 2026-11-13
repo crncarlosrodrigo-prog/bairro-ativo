@@ -1,6 +1,6 @@
 /* Service worker do Bairro Ativo: guarda os arquivos do app para funcionar sem internet.
    Ao publicar uma nova versão, aumente o número em VERSAO. */
-const VERSAO = 'bairro-ativo-v4';
+const VERSAO = 'bairro-ativo-v5';
 const ARQUIVOS = [
   './',
   './index.html',
@@ -13,7 +13,9 @@ const ARQUIVOS = [
   './vendor/firebase-auth-compat.js',
   './vendor/firebase-firestore-compat.js',
   './icons/icon-192.png',
-  './icons/icon-512.png'
+  './icons/icon-512.png',
+  './icons/icon-maskable-192.png',
+  './icons/icon-maskable-512.png'
 ];
 
 self.addEventListener('install', e => {
