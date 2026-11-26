@@ -1,6 +1,6 @@
 /* Service worker do Bairro Ativo: guarda os arquivos do app para funcionar sem internet.
    Ao publicar uma nova versão, aumente o número em VERSAO. */
-const VERSAO = 'bairro-ativo-v5';
+const VERSAO = 'bairro-ativo-v6c';
 const ARQUIVOS = [
   './',
   './index.html',
